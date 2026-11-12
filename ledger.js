@@ -3,8 +3,19 @@ export const types = {expense:'消费', refund:'退款', transfer:'划转', inco
 export const groups = {cash:'现金与存款',restricted:'受限与定期资产',physical:'实物资产',debt:'待还负债'};
 export const sources = ['微信支付','支付宝','信用卡','其他截图','手动'];
 export const yen = cents => new Intl.NumberFormat('zh-CN',{style:'currency',currency:'CNY'}).format(cents/100);
-export const id = () => globalThis.crypto.randomUUID();
-export const today = () => new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format();
+export const id = () => {
+  if(globalThis.crypto.randomUUID)return globalThis.crypto.randomUUID();
+  const bytes=globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6]=(bytes[6]&15)|64;
+  bytes[8]=(bytes[8]&63)|128;
+  const hex=Array.from(bytes,byte=>byte.toString(16).padStart(2,'0')).join('');
+  return [hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20)].join('-');
+};
+const shanghaiDate=new Intl.DateTimeFormat('en',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'});
+export const today = () => {
+  const parts=Object.fromEntries(shanghaiDate.formatToParts().map(({type,value})=>[type,value]));
+  return [parts.year,parts.month,parts.day].join('-');
+};
 export function shiftDays(date,days) {
   const day=new Date(date+'T00:00:00Z');
   day.setUTCDate(day.getUTCDate()+days);

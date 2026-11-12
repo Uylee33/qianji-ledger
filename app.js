@@ -1,4 +1,4 @@
-import {categories,types,groups,sources,yen,id,today,shiftDays,weekStart,validDate,validTime,normalize,categoryFor,matches,report,parseOCR,resolveOriginal,creditStatement,parseCreditStatement,creditRowKey,readCheckedBill,planBillImport} from './ledger.js?v=11';
+import {categories,types,groups,sources,yen,id,today,shiftDays,weekStart,validDate,validTime,normalize,categoryFor,matches,report,parseOCR,resolveOriginal,creditStatement,parseCreditStatement,creditRowKey,readCheckedBill,planBillImport} from './ledger.js?v=12';
 
 const key='qianji-ledger-public-v1';
 const empty=()=>({rows:[],assets:[],rules:{},budgets:{},imports:[],customCategories:[]});
@@ -440,8 +440,8 @@ function editAsset(row,group) {
 function uploadDialog() {
   modal('批量导入截图','<div class="notice">截图在当前浏览器识别。导入后先核对金额、日期和疑似重复，再确认入账。</div>'+
     '<form id="upload-form">'+choice('账单来源','source',options(sources.slice(0,4)),'微信支付',true)+
-    '<p class="sub">每批最多 12 张，支持 PNG、JPEG、WebP。不同平台可分批上传，照样交叉查重。</p>'+
-    '<div class="file-box stack"><input name="screens" type="file" accept="image/png,image/jpeg,image/webp" multiple required aria-label="选择账单截图"></div>'+
+    '<p class="sub">每批最多 12 张，建议使用 PNG、JPEG 或 WebP 截图。不同平台可分批上传，照样交叉查重。</p>'+
+    '<div class="file-box stack"><input name="screens" type="file" accept="image/*" multiple required aria-label="选择账单截图"></div>'+
     '<p id="ocr-status" class="sub" aria-live="polite"></p><progress id="ocr-progress" max="1" value="0" hidden></progress>'+
     '<div class="actions form-actions"><button class="btn primary" id="start-ocr">'+icon('scan')+'开始识别</button></div></form>');
 }
@@ -625,37 +625,104 @@ function switchMode(next) {
   persist();
   setPage('home');
 }
+const ocrPath=name=>new URL('./ocr/'+name,import.meta.url).href;
 let engineScript;
+function withTimeout(task, milliseconds, message) {
+  let timer;
+  const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(message)),milliseconds);});
+  return Promise.race([task,timeout]).finally(()=>clearTimeout(timer));
+}
 function loadEngine() {
-  if(window.Tesseract)return Promise.resolve();
+  if(window.Tesseract?.createWorker)return Promise.resolve();
   engineScript??=new Promise((resolve,reject)=>{
-    const script=document.createElement('script');script.src=new URL('./ocr/tesseract.min.js',location.href);
-    script.onload=resolve;script.onerror=()=>{script.remove();engineScript=null;reject(new Error('识别组件加载失败'));};
+    const script=document.createElement('script');
+    const fail=()=>{
+      clearTimeout(timer);
+      script.remove();
+      engineScript=null;
+      reject(new Error('识别组件下载失败，请检查网络后重试。'));
+    };
+    const timer=setTimeout(fail,30000);
+    script.src=ocrPath('tesseract.min.js');
+    script.onload=()=>{
+      if(!window.Tesseract?.createWorker){fail();return;}
+      clearTimeout(timer);
+      resolve();
+    };
+    script.onerror=fail;
     document.head.append(script);
   });
   return engineScript;
 }
-async function fingerprint(file) {
-  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await file.arrayBuffer())),n=>n.toString(16).padStart(2,'0')).join('');
-}
-async function creditAmountColumn(file) {
-  const bitmap=await createImageBitmap(file);
+async function createOcrWorker(languages,logger=()=>{}) {
+  if(typeof Worker!=='function'||typeof WebAssembly!=='object') {
+    throw new Error('当前浏览器无法运行截图识别，请用系统浏览器打开此网址。');
+  }
+  await loadEngine();
+  let rejectStartup;
+  const startupError=new Promise((_,reject)=>{rejectStartup=reject;});
+  const opening=window.Tesseract.createWorker(languages,1,{
+    workerPath:ocrPath('worker.min.js'),
+    corePath:ocrPath('tesseract-core-lstm.wasm.js'),
+    langPath:ocrPath(''),
+    workerBlobURL:false,
+    cacheMethod:'none',
+    logger,
+    errorHandler:reason=>rejectStartup?.(new Error(String(reason)))
+  });
   try {
-    const {width,height}=bitmap, scale=2;
-    const x=Math.round(width*.713), y=Math.round(height*.172);
-    const cropWidth=Math.round(width*.951)-x, cropHeight=Math.round(height*.98)-y;
+    return await withTimeout(Promise.race([opening,startupError]),60000,'识别组件加载超时，请检查网络后重试。');
+  } catch(error) {
+    void opening.then(worker=>worker.terminate()).catch(()=>{});
+    if(error instanceof Error && error.message.includes('加载超时'))throw error;
+    throw new Error('识别组件启动失败。请检查网络，或用系统浏览器打开此网址。',{cause:error});
+  } finally {
+    rejectStartup=null;
+  }
+}
+async function fingerprint(file) {
+  try {
+    if(!globalThis.crypto?.subtle)return '';
+    const bytes=await new Response(file).arrayBuffer();
+    const digest=await crypto.subtle.digest('SHA-256',bytes);
+    return Array.from(new Uint8Array(digest),n=>n.toString(16).padStart(2,'0')).join('');
+  } catch {return '';}
+}
+async function prepareOcrImage(file) {
+  const url=URL.createObjectURL(file);
+  try {
+    const image=new Image();
+    await withTimeout(new Promise((resolve,reject)=>{
+      image.onload=resolve;
+      image.onerror=()=>reject(new Error('无法读取图片，请换成 PNG 或 JPEG 截图'));
+      image.src=url;
+    }),15000,'读取图片超时，请重新选图');
+    const width=image.naturalWidth,height=image.naturalHeight;
+    if(!width||!height)throw new Error('无法读取图片尺寸，请重新选图');
+    const scale=Math.min(1,4096/Math.max(width,height),Math.sqrt(6000000/(width*height)));
+    if(scale===1&&['image/png','image/jpeg','image/webp'].includes(file.type))return {pixels:image,input:file};
     const canvas=document.createElement('canvas');
-    canvas.width=cropWidth*scale;canvas.height=cropHeight*scale;
-    const context=canvas.getContext('2d',{willReadFrequently:true});
-    context.drawImage(bitmap,x,y,cropWidth,cropHeight,0,0,canvas.width,canvas.height);
-    const pixels=context.getImageData(0,0,canvas.width,canvas.height);
-    for(let i=0;i<pixels.data.length;i+=4) {
-      const level=pixels.data[i]*.299+pixels.data[i+1]*.587+pixels.data[i+2]*.114;
-      pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=level<211?0:255;
-    }
-    context.putImageData(pixels,0,0);
-    return {canvas,x,y,scale,height};
-  } finally {bitmap.close();}
+    canvas.width=Math.max(1,Math.round(width*scale));
+    canvas.height=Math.max(1,Math.round(height*scale));
+    canvas.getContext('2d',{alpha:false}).drawImage(image,0,0,canvas.width,canvas.height);
+    return {pixels:canvas,input:canvas};
+  } finally {URL.revokeObjectURL(url);}
+}
+function creditAmountColumn(pixels) {
+  const width=pixels.naturalWidth||pixels.width, height=pixels.naturalHeight||pixels.height, scale=2;
+  const x=Math.round(width*.713), y=Math.round(height*.172);
+  const cropWidth=Math.max(1,Math.round(width*.951)-x), cropHeight=Math.max(1,Math.round(height*.98)-y);
+  const canvas=document.createElement('canvas');
+  canvas.width=cropWidth*scale;canvas.height=cropHeight*scale;
+  const context=canvas.getContext('2d',{willReadFrequently:true});
+  context.drawImage(pixels,x,y,cropWidth,cropHeight,0,0,canvas.width,canvas.height);
+  const pixelsData=context.getImageData(0,0,canvas.width,canvas.height);
+  for(let i=0;i<pixelsData.data.length;i+=4) {
+    const level=pixelsData.data[i]*.299+pixelsData.data[i+1]*.587+pixelsData.data[i+2]*.114;
+    pixelsData.data[i]=pixelsData.data[i+1]=pixelsData.data[i+2]=level<211?0:255;
+  }
+  context.putImageData(pixelsData,0,0);
+  return {canvas,x,y,scale,height};
 }
 async function importImages(form) {
   if(busy)return;
@@ -672,37 +739,33 @@ async function importImages(form) {
   const unread=[];
   try {
     status.textContent='正在加载中文识别组件，首次使用可能需要片刻…';
-    await loadEngine();
-    const path=name=>new URL('./ocr/'+name,location.href).href;
-    worker=await window.Tesseract.createWorker('chi_sim+eng',1,{
-      workerPath:path('worker.min.js'),corePath:path('tesseract-core-lstm.wasm.js'),langPath:path(''),
-      logger:m=>{if(m.status==='recognizing text')progress.value=(fileIndex+m.progress)/files.length;}
+    worker=await createOcrWorker('chi_sim+eng',message=>{
+      if(message.status==='recognizing text')progress.value=(fileIndex+message.progress)/files.length;
     });
-    await worker.setParameters({tessedit_pageseg_mode:'6'});
+    await withTimeout(worker.setParameters({tessedit_pageseg_mode:'6'}),15000,'识别组件响应超时，请重试。');
     for(const file of files) {
       status.textContent='正在识别第 '+(fileIndex+1)+' / '+files.length+' 张…';
       try {
         const hash=await fingerprint(file);
-        if(hashes.has(hash)) {
+        if(hash&&hashes.has(hash)) {
           batch.skipped++;batch.issues.push(file.name+'：同一张截图已导入');
         } else {
-          const result=await worker.recognize(file,{}, {tsv:source==='信用卡'});
+          const image=await prepareOcrImage(file);
+          const result=await withTimeout(worker.recognize(image.input,{}, {tsv:source==='信用卡'}),60000,'识别超时，请尝试单张较小的截图');
           const text=result.data.text;
           const statement=source==='信用卡'&&creditStatement(text);
           let rows;
           if(statement) {
             if(!amountWorker) {
-              amountWorker=await window.Tesseract.createWorker('eng',1,{
-                workerPath:path('worker.min.js'),corePath:path('tesseract-core-lstm.wasm.js'),langPath:path('')
-              });
-              await amountWorker.setParameters({tessedit_pageseg_mode:'11',tessedit_char_whitelist:'0123456789.-¥'});
+              amountWorker=await createOcrWorker('eng');
+              await withTimeout(amountWorker.setParameters({tessedit_pageseg_mode:'11',tessedit_char_whitelist:'0123456789.-¥'}),15000,'金额识别组件响应超时');
             }
-            const crop=await creditAmountColumn(file);
-            const amountResult=await amountWorker.recognize(crop.canvas,{}, {tsv:true});
+            const crop=creditAmountColumn(image.pixels);
+            const amountResult=await withTimeout(amountWorker.recognize(crop.canvas,{}, {tsv:true}),60000,'金额识别超时，请尝试单张较小的截图');
             rows=parseCreditStatement(result.data.tsv,amountResult.data.tsv,statement,crop,real.rules);
           } else rows=parseOCR(text,source,importMonth,real.rules);
           if(rows.length) {
-            hashes.add(hash);
+            if(hash)hashes.add(hash);
             for(const row of rows) {
               const key=creditRowKey(row);
               if(key&&known.has(key)) {batch.duplicates++;continue;}
@@ -715,7 +778,18 @@ async function importImages(form) {
             unread.push({name:file.name,text});
           }
         }
-      } catch {batch.skipped++;batch.issues.push(file.name+'：识别失败，请换清晰截图或补录');}
+      } catch(error) {
+        const reason=error instanceof Error&&/超时|请重新选图|无法读取图片|组件/.test(error.message)
+          ?error.message:'识别失败，请换清晰截图或补录';
+        batch.skipped++;
+        batch.issues.push(file.name+'：'+reason);
+        if(reason.includes('超时')&&!reason.includes('读取图片')) {
+          const remaining=files.length-fileIndex-1;
+          batch.skipped+=remaining;
+          if(remaining)batch.issues.push('还有 '+remaining+' 张未处理，请分批重新导入。');
+          break;
+        }
+      }
       fileIndex++;progress.value=fileIndex/files.length;
     }
     real.imports.push(batch);
@@ -726,12 +800,12 @@ async function importImages(form) {
       '<div class="actions form-actions">'+button('手动补录','new')+button('查看待核对','close','primary')+'</div>');
   } catch (error) {
     console.error('OCR setup failed',error);
-    status.textContent='识别组件未加载成功，请重试，也可以先手动补录。';
+    status.textContent=error instanceof Error?error.message:'识别组件未加载成功，请重试，也可以先手动补录。';
   } finally {
     if(worker)await worker.terminate().catch(()=>{});
     if(amountWorker)await amountWorker.terminate().catch(()=>{});
     busy=false;
-    if(form.isConnected){form.elements.screens.disabled=false;form.elements.source.disabled=false;$('#start-ocr').disabled=false;}
+    if(form.isConnected){progress.hidden=true;form.elements.screens.disabled=false;form.elements.source.disabled=false;$('#start-ocr').disabled=false;}
   }
 }
 dialog.addEventListener('cancel',event=>{if(busy)event.preventDefault();else depositDraft=null;});
